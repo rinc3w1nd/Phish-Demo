@@ -66,15 +66,26 @@ create_iso() {
 
   if [[ "$ISO_TOOL" == "genisoimage" || "$ISO_TOOL" == "mkisofs" ]]; then
     # use -volid cidata and rock/joliet options
-    genisoimage -output "$out" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
+    if ! "$ISO_TOOL" -output "$out" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1; then
+      echo "    Failed to run $ISO_TOOL" >&2
+      return 1
+    fi
   else
     # macOS: use hdiutil makehybrid
     # put both files into a temp dir and use hdiutil
     tmpd=$(mktemp -d)
     cp "$ud" "$tmpd/user-data"
     cp "$md" "$tmpd/meta-data"
-    hdiutil makehybrid -o "$out" -hfs -joliet -iso -default-volume-name cidata -joliet "$tmpd" >/dev/null 2>&1
+    if ! hdiutil makehybrid -o "$out" -hfs -joliet -iso -default-volume-name cidata -joliet "$tmpd" >/dev/null 2>&1; then
+      echo "    Failed to run hdiutil" >&2
+      rm -rf "$tmpd"
+      return 1
+    fi
     rm -rf "$tmpd"
+    # Some hdiutil versions append .cdr; rename to requested path for consistency
+    if [[ ! -f "$out" && -f "${out}.cdr" ]]; then
+      mv "${out}.cdr" "$out"
+    fi
   fi
 
   if [[ -f "$out" ]]; then
