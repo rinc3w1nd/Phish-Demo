@@ -1,0 +1,56 @@
+#cloud-config
+hostname: lab-victim
+manage_etc_hosts: true
+
+users:
+  - name: victim
+    gecos: Lab Victim
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-rsa AAAA...YOUR_PUB_KEY...<<<REPLACE_WITH_YOUR_SSH_PUB>>>
+
+package_update: true
+package_upgrade: true
+packages:
+  - thunderbird
+  - curl
+  - ca-certificates
+
+write_files:
+  - path: /etc/netplan/50-lab-network.yaml
+    permissions: '0644'
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: no
+            addresses: [10.0.100.40/24]
+            gateway4: 10.0.100.1
+            nameservers:
+              addresses: [10.0.100.1]
+
+  - path: /home/victim/demo-phish.eml
+    owner: victim:victim
+    permissions: '0644'
+    content: |
+      From: "IT Support" <it-support@demo-corp.example>
+      To: "Tester" <tester@demo.local>
+      Subject: Action required: Confirm your account
+      MIME-Version: 1.0
+      Content-Type: text/html; charset=UTF-8
+
+      <html><body>
+      <p>Dear Tester,</p>
+      <p>Please <a href="https://login.cloud.example/login?user=tester_demo">click here to confirm</a>.</p>
+      <p>This is a demo.</p>
+      </body></html>
+
+runcmd:
+  - [ sh, -c, "netplan apply || true" ]
+  - [ sh, -c, "chown victim:victim /home/victim/demo-phish.eml || true" ]
+
+final_message: |
+  LAB-VICTIM cloud-init complete. Open Thunderbird and import/open ~/demo-phish.eml to start the demo.

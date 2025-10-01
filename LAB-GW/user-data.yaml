@@ -1,0 +1,115 @@
+#cloud-config
+hostname: lab-gw
+manage_etc_hosts: true
+
+users:
+  - name: labadmin
+    gecos: Lab Gateway Admin
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-rsa AAAA...YOUR_PUB_KEY...<<<REPLACE_WITH_YOUR_SSH_PUB>>>
+
+package_update: true
+package_upgrade: true
+packages:
+  - wireguard
+  - iptables-persistent
+  - dnsmasq
+  - net-tools
+  - tcpdump
+  - cron
+  - python3
+
+write_files:
+  # netplan static IP (host-only)
+  - path: /etc/netplan/50-lab-network.yaml
+    permissions: '0644'
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: no
+            addresses: [10.0.100.1/24]
+            nameservers:
+              addresses: [127.0.0.1]
+            routes: []
+           eth1:
+            dhcp4: yes
+
+  # dnsmasq stub (resolve login.cloud.example -> CLOUD_IP)
+  - path: /etc/dnsmasq.d/lab.conf
+    permissions: '0644'
+    content: |
+      listen-address=127.0.0.1,10.0.100.1
+      bind-interfaces
+      no-resolv
+      server=8.8.8.8
+      address=/login.cloud.example/CLOUD_IP    # <<<REPLACE CLOUD_IP or remove if you prefer /etc/hosts>
+      cache-size=1000
+
+  # iptables script (lab-iptables.sh)
+  - path: /usr/local/sbin/lab-iptables.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      CLOUD_IP=CLOUD_IP  # <<<REPLACE
+      LAB_SUBNET=10.0.100.0/24
+      IF_LAB=eth0
+      IF_WG=wg0
+
+      iptables -F
+      iptables -t nat -F
+      iptables -X
+
+      iptables -P FORWARD DROP
+      iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+      iptables -A FORWARD -s $LAB_SUBNET -d $CLOUD_IP -i $IF_LAB -o $IF_WG -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
+
+      iptables -A FORWARD -s $LAB_SUBNET -o $IF_WG -j DROP
+      iptables -A FORWARD -s $LAB_SUBNET ! -o $IF_WG -j DROP
+
+      iptables -t nat -A POSTROUTING -s $LAB_SUBNET -d $CLOUD_IP -o $IF_WG -j MASQUERADE
+
+      # allow WG handshake (adjust port if needed)
+      iptables -A OUTPUT -o $IF_LAB -p udp --dport 51820 -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+      iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+  # wg-watchdog: check wg0 and apply fail-closed if down
+  - path: /usr/local/bin/wg-watchdog.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      WG_IF=wg0
+      LAB_NET=10.0.100.0/24
+
+      check_wg() {
+        ip link show dev $WG_IF >/dev/null 2>&1 || return 1
+        ip addr show dev $WG_IF | grep -q "inet " || return 1
+        return 0
+      }
+
+      if check_wg; then
+        iptables -D FORWARD -s $LAB_NET -j DROP 2>/dev/null || true
+        logger -t wg-watchdog "wg0 up — removed fail-closed"
+        exit 0
+      else
+        iptables -I FORWARD 1 -s $LAB_NET -j DROP 2>/dev/null || true
+        logger -t wg-watchdog "wg0 down — applied fail-closed"
+        exit 2
+      fi
+
+runcmd:
+  - [ sh, -c, "netplan apply || true" ]
+  - [ sh, -c, "systemctl enable --now dnsmasq || true" ]
+  - [ sh, -c, "chmod +x /usr/local/sbin/lab-iptables.sh && /usr/local/sbin/lab-iptables.sh || true" ]
+  - [ sh, -c, "systemctl daemon-reload || true" ]
+  - [ sh, -c, "cat > /etc/systemd/system/wg-watchdog.service <<'SVC'\n[Unit]\nDescription=WG Watchdog\nAfter=network-online.target\n[Service]\nType=oneshot\nExecStart=/usr/local/bin/wg-watchdog.sh\n[Install]\nWantedBy=multi-user.target\nSVC" ]
+  - [ sh, -c, "cat > /etc/systemd/system/wg-watchdog.timer <<'TMR'\n[Unit]\nDescription=Run wg-watchdog every 10s\n[Timer]\nOnUnitActiveSec=10s\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\nTMR" ]
+  - [ sh, -c, "systemctl daemon-reload && systemctl enable --now wg-watchdog.timer || true" ]
+
+final_message: |
+  LAB-GW cloud-init complete. Edit /etc/wireguard/wg0.conf with real keys and start wg-quick@wg0.

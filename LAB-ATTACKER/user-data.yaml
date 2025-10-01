@@ -1,0 +1,43 @@
+# attacker-user-data-static.yaml
+# LAB-ATTACKER with static IP 10.0.100.30
+# Replace SSH key placeholder
+# Use this instead of the previous attacker user-data
+#cloud-config
+hostname: lab-attacker
+manage_etc_hosts: true
+
+users:
+  - name: attacker
+    gecos: Lab Attacker
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-rsa AAAA...YOUR_PUB_KEY...<<<REPLACE_WITH_YOUR_SSH_PUB>>>
+
+package_update: true
+packages:
+  - python3
+  - python3-pip
+  - curl
+
+write_files:
+  - path: /etc/netplan/50-lab-network.yaml
+    permissions: '0644'
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: no
+            addresses: [10.0.100.30/24]
+            gateway4: 10.0.100.1
+            nameservers:
+              addresses: [10.0.100.1]
+
+runcmd:
+  - [ sh, -c, "python3 -m pip install --user requests || true" ]
+  - [ sh, -c, "mkdir -p /home/attacker/tools && cat > /home/attacker/tools/replay.py <<'PY'\nimport requests, sys\nSERVER='https://login.cloud.example'\nif len(sys.argv) < 2:\n    print('Usage: replay.py <token>'); sys.exit(1)\n\ntoken = sys.argv[1]\nresp = requests.get(SERVER + '/protected', headers={'X-DEMO-TOKEN': token}, verify=False)\nprint(resp.status_code, resp.text)\nPY\nchown attacker:attacker /home/attacker/tools/replay.py || true" ]
+
+final_message: |
+  LAB-ATTACKER cloud-init complete with static IP 10.0.100.30. Use /home/attacker/tools/replay.py <token>.

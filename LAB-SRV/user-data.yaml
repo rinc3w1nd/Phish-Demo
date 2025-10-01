@@ -1,0 +1,110 @@
+#cloud-config
+hostname: lab-srv
+manage_etc_hosts: true
+
+users:
+  - name: demo
+    gecos: Lab Demo
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-rsa AAAA...YOUR_PUB_KEY...<<<REPLACE_WITH_YOUR_SSH_PUB>>>
+
+package_update: true
+package_upgrade: true
+packages:
+  - python3
+  - python3-venv
+  - python3-pip
+  - nginx
+  - openssl
+  - curl
+
+write_files:
+  - path: /etc/netplan/50-lab-network.yaml
+    permissions: '0644'
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          eth0:
+            dhcp4: no
+            addresses: [10.0.100.20/24]
+            gateway4: 10.0.100.1
+            nameservers:
+              addresses: [10.0.100.1]
+
+  - path: /opt/demo/app.py
+    permissions: '0644'
+    owner: demo:demo
+    content: |
+      from flask import Flask, request, make_response, jsonify
+      import secrets, time, logging
+      app = Flask(__name__)
+      TOKENS = {}
+      logging.basicConfig(level=logging.INFO)
+      @app.route('/login', methods=['GET','POST'])
+      def login():
+          demo_user = request.args.get('user','demo_user')
+          token = 'demo-' + secrets.token_urlsafe(8)
+          TOKENS[token] = {'user': demo_user, 'ts': time.time()}
+          app.logger.info("Issued demo token %s for %s", token, demo_user)
+          resp = make_response(f"Demo login OK. Token: {token}\\n")
+          resp.headers['X-DEMO-TOKEN'] = token
+          return resp
+      @app.route('/protected', methods=['GET'])
+      def protected():
+          token = request.headers.get('X-DEMO-TOKEN') or request.args.get('token')
+          if not token or token not in TOKENS:
+              return ("Unauthorized\\n", 401)
+          info = TOKENS[token]
+          return (f"Access granted for {info['user']} (token {token})\\n", 200)
+      @app.route('/status', methods=['GET'])
+      def status():
+          return jsonify({"tokens_issued": len(TOKENS)})
+      if __name__ == '__main__':
+          app.run(host='127.0.0.1', port=5000)
+
+  - path: /etc/nginx/sites-available/demo
+    permissions: '0644'
+    content: |
+      server {
+          listen 443 ssl;
+          server_name login.cloud.example;
+          ssl_certificate /etc/ssl/demo/login.cloud.example.crt;
+          ssl_certificate_key /etc/ssl/demo/login.cloud.example.key;
+          location / {
+              proxy_pass http://127.0.0.1:5000;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+          }
+      }
+
+  - path: /etc/ssl/demo/login.cloud.example.key
+    permissions: '0600'
+    content: |
+      -----BEGIN RSA PRIVATE KEY-----
+      <<<SELF_SIGNED_KEY_PLACEHOLDER>>>
+      -----END RSA PRIVATE KEY-----
+
+  - path: /etc/ssl/demo/login.cloud.example.crt
+    permissions: '0644'
+    content: |
+      -----BEGIN CERTIFICATE-----
+      <<<SELF_SIGNED_CERT_PLACEHOLDER>>>
+      -----END CERTIFICATE-----
+
+runcmd:
+  - [ sh, -c, "netplan apply || true" ]
+  - [ sh, -c, "mkdir -p /opt/demo && chown demo:demo /opt/demo || true" ]
+  - [ sh, -c, "python3 -m venv /opt/demo/venv && /opt/demo/venv/bin/pip install --upgrade pip flask || true" ]
+  - [ sh, -c, "cp /opt/demo/app.py /opt/demo/app.py || true; chown demo:demo /opt/demo/app.py" ]
+  - [ sh, -c, "cat > /etc/systemd/system/demo.service <<'SVC'\n[Unit]\nDescription=Demo token server\nAfter=network.target\n[Service]\nUser=demo\nWorkingDirectory=/opt/demo\nEnvironment=PATH=/opt/demo/venv/bin\nExecStart=/opt/demo/venv/bin/python /opt/demo/app.py\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\nSVC" ]
+  - [ sh, -c, "systemctl daemon-reload && systemctl enable --now demo.service || true" ]
+  - [ sh, -c, "ln -sf /etc/nginx/sites-available/demo /etc/nginx/sites-enabled/demo || true" ]
+  - [ sh, -c, "rm -f /etc/nginx/sites-enabled/default || true" ]
+  - [ sh, -c, "nginx -t && systemctl restart nginx || true" ]
+
+final_message: |
+  LAB-SRV cloud-init complete. If you plan to use lab CA certs, replace /etc/ssl/demo/login.cloud.example.* with CA-signed files and reload nginx.
