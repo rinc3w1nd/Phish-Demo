@@ -4,23 +4,25 @@ manage_etc_hosts: true
 
 users:
   - name: demo
-    gecos: Lab Demo
+    gecos: Lab Demo Server
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     ssh_authorized_keys:
-      - ssh-rsa AAAA...YOUR_PUB_KEY...<<<REPLACE_WITH_YOUR_SSH_PUB>>>
+      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD...REPLACE_WITH_YOUR_PUBKEY...
 
 package_update: true
 package_upgrade: true
 packages:
   - python3
   - python3-venv
-  - python3-pip
   - nginx
-  - openssl
   - curl
+  - iproute2
+  - net-tools
+  - tcpdump
 
 write_files:
+  # Netplan config: static IP for SRV
   - path: /etc/netplan/50-lab-network.yaml
     permissions: '0644'
     content: |
@@ -35,76 +37,86 @@ write_files:
             nameservers:
               addresses: [10.0.100.1]
 
-  - path: /opt/demo/app.py
+  # Flask demo server systemd unit
+  - path: /etc/systemd/system/demo-server.service
     permissions: '0644'
-    owner: demo:demo
     content: |
-      from flask import Flask, request, make_response, jsonify
-      import secrets, time, logging
-      app = Flask(__name__)
-      TOKENS = {}
-      logging.basicConfig(level=logging.INFO)
-      @app.route('/login', methods=['GET','POST'])
-      def login():
-          demo_user = request.args.get('user','demo_user')
-          token = 'demo-' + secrets.token_urlsafe(8)
-          TOKENS[token] = {'user': demo_user, 'ts': time.time()}
-          app.logger.info("Issued demo token %s for %s", token, demo_user)
-          resp = make_response(f"Demo login OK. Token: {token}\\n")
-          resp.headers['X-DEMO-TOKEN'] = token
-          return resp
-      @app.route('/protected', methods=['GET'])
-      def protected():
-          token = request.headers.get('X-DEMO-TOKEN') or request.args.get('token')
-          if not token or token not in TOKENS:
-              return ("Unauthorized\\n", 401)
-          info = TOKENS[token]
-          return (f"Access granted for {info['user']} (token {token})\\n", 200)
-      @app.route('/status', methods=['GET'])
-      def status():
-          return jsonify({"tokens_issued": len(TOKENS)})
-      if __name__ == '__main__':
-          app.run(host='127.0.0.1', port=5000)
+      [Unit]
+      Description=Phish Demo Flask Server
+      After=network.target
 
-  - path: /etc/nginx/sites-available/demo
+      [Service]
+      User=demo
+      WorkingDirectory=/home/demo/demo-app
+      ExecStart=/usr/bin/python3 /home/demo/demo-app/app.py
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # Nginx config to proxy to Flask app, using CA-signed cert
+  - path: /etc/nginx/sites-available/demo.conf
     permissions: '0644'
     content: |
       server {
-          listen 443 ssl;
-          server_name login.cloud.example;
-          ssl_certificate /etc/ssl/demo/login.cloud.example.crt;
-          ssl_certificate_key /etc/ssl/demo/login.cloud.example.key;
-          location / {
-              proxy_pass http://127.0.0.1:5000;
-              proxy_set_header Host $host;
-              proxy_set_header X-Real-IP $remote_addr;
-          }
+        listen 443 ssl;
+        server_name login.cloud.example;
+
+        ssl_certificate     /etc/ssl/demo/login.cloud.example.crt;
+        ssl_certificate_key /etc/ssl/demo/login.cloud.example.key;
+
+        location / {
+          proxy_pass http://127.0.0.1:5000;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+        }
       }
 
-  - path: /etc/ssl/demo/login.cloud.example.key
-    permissions: '0600'
-    content: |
-      -----BEGIN RSA PRIVATE KEY-----
-      <<<SELF_SIGNED_KEY_PLACEHOLDER>>>
-      -----END RSA PRIVATE KEY-----
-
-  - path: /etc/ssl/demo/login.cloud.example.crt
-    permissions: '0644'
-    content: |
-      -----BEGIN CERTIFICATE-----
-      <<<SELF_SIGNED_CERT_PLACEHOLDER>>>
-      -----END CERTIFICATE-----
-
 runcmd:
+  # Apply network
   - [ sh, -c, "netplan apply || true" ]
-  - [ sh, -c, "mkdir -p /opt/demo && chown demo:demo /opt/demo || true" ]
-  - [ sh, -c, "python3 -m venv /opt/demo/venv && /opt/demo/venv/bin/pip install --upgrade pip flask || true" ]
-  - [ sh, -c, "cp /opt/demo/app.py /opt/demo/app.py || true; chown demo:demo /opt/demo/app.py" ]
-  - [ sh, -c, "cat > /etc/systemd/system/demo.service <<'SVC'\n[Unit]\nDescription=Demo token server\nAfter=network.target\n[Service]\nUser=demo\nWorkingDirectory=/opt/demo\nEnvironment=PATH=/opt/demo/venv/bin\nExecStart=/opt/demo/venv/bin/python /opt/demo/app.py\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\nSVC" ]
-  - [ sh, -c, "systemctl daemon-reload && systemctl enable --now demo.service || true" ]
-  - [ sh, -c, "ln -sf /etc/nginx/sites-available/demo /etc/nginx/sites-enabled/demo || true" ]
-  - [ sh, -c, "rm -f /etc/nginx/sites-enabled/default || true" ]
-  - [ sh, -c, "nginx -t && systemctl restart nginx || true" ]
+  # Setup demo app
+  - [ sh, -c, "mkdir -p /home/demo/demo-app" ]
+  - [ sh, -c, "cat > /home/demo/demo-app/app.py <<'PY'
+import os
+from flask import Flask, request, jsonify
+app = Flask(__name__)
+
+@app.route('/login')
+def login():
+    user = request.args.get('user', 'unknown')
+    token = f'demo-token-for-{user}'
+    resp = jsonify({'status':'ok','user':user,'token':token})
+    resp.headers['X-DEMO-TOKEN'] = token
+    return resp
+
+@app.route('/protected')
+def protected():
+    token = request.headers.get('X-DEMO-TOKEN')
+    if token:
+        return jsonify({'status':'access granted','token':token})
+    return jsonify({'status':'denied'}), 403
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000)
+PY" ]
+  - [ sh, -c, "chown -R demo:demo /home/demo/demo-app" ]
+  - [ sh, -c, "systemctl enable --now demo-server" ]
+
+  # Create placeholder certs (so nginx starts even before CA certs copied)
+  - [ sh, -c, "mkdir -p /etc/ssl/demo" ]
+  - [ sh, -c, "openssl req -x509 -nodes -days 1 -newkey rsa:2048 -keyout /etc/ssl/demo/login.cloud.example.key -out /etc/ssl/demo/login.cloud.example.crt -subj '/CN=login.cloud.example'" ]
+  - [ sh, -c, "ln -s /etc/nginx/sites-available/demo.conf /etc/nginx/sites-enabled/demo.conf || true" ]
+  - [ sh, -c, "systemctl restart nginx" ]
+  - [ sh, -c, "echo 'Replace /etc/ssl/demo/login.cloud.example.{crt,key} with CA-signed files from lab-ca.sh and reload nginx' > /etc/motd" ]
 
 final_message: |
-  LAB-SRV cloud-init complete. If you plan to use lab CA certs, replace /etc/ssl/demo/login.cloud.example.* with CA-signed files and reload nginx.
+  LAB-SRV bootstrap finished.
+  * Replace dummy cert with CA-signed one:
+      scp demo-login.lab.crt.pem demo@login.cloud.example:/tmp/
+      scp demo-login.lab.key.pem demo@login.cloud.example:/tmp/
+      sudo mv /tmp/demo-login.lab.crt.pem /etc/ssl/demo/login.cloud.example.crt
+      sudo mv /tmp/demo-login.lab.key.pem /etc/ssl/demo/login.cloud.example.key
+      sudo systemctl reload nginx
+  * Demo app listening on https://login.cloud.example/login
+  * Demo app returns X-DEMO-TOKEN header
