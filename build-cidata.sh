@@ -66,15 +66,26 @@ create_iso() {
 
   if [[ "$ISO_TOOL" == "genisoimage" || "$ISO_TOOL" == "mkisofs" ]]; then
     # use -volid cidata and rock/joliet options
-    genisoimage -output "$out" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
+    if ! "$ISO_TOOL" -output "$out" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1; then
+      echo "    Failed to run $ISO_TOOL" >&2
+      return 1
+    fi
   else
     # macOS: use hdiutil makehybrid
     # put both files into a temp dir and use hdiutil
     tmpd=$(mktemp -d)
     cp "$ud" "$tmpd/user-data"
     cp "$md" "$tmpd/meta-data"
-    hdiutil makehybrid -o "$out" -hfs -joliet -iso -default-volume-name cidata -joliet "$tmpd" >/dev/null 2>&1
+    if ! hdiutil makehybrid -o "$out" -hfs -joliet -iso -default-volume-name cidata -joliet "$tmpd" >/dev/null 2>&1; then
+      echo "    Failed to run hdiutil" >&2
+      rm -rf "$tmpd"
+      return 1
+    fi
     rm -rf "$tmpd"
+    # Some hdiutil versions append .cdr; rename to requested path for consistency
+    if [[ ! -f "$out" && -f "${out}.cdr" ]]; then
+      mv "${out}.cdr" "$out"
+    fi
   fi
 
   if [[ -f "$out" ]]; then
@@ -82,6 +93,31 @@ create_iso() {
   else
     echo "    Failed to create $out" >&2
     return 1
+  fi
+}
+
+# read command output into array, compatible with older bash (e.g. macOS)
+read_into_array() {
+  local __array_name="$1"
+  shift
+
+  local __pieces=()
+  local __part
+  for __part in "$@"; do
+    __pieces+=("$(printf '%q' "$__part")")
+  done
+  local __cmd="${__pieces[*]}"
+
+  # Prefer mapfile/readarray when available (bash >= 4)
+  if help mapfile >/dev/null 2>&1; then
+    # shellcheck disable=SC2034  # Indirect assignment handled by eval
+    eval "mapfile -t $__array_name < <($__cmd)"
+  else
+    local __line
+    while IFS= read -r __line; do
+      # shellcheck disable=SC2034
+      eval "$__array_name+=(\"\$__line\")"
+    done < <(eval "$__cmd")
   fi
 }
 
@@ -120,8 +156,10 @@ for p in "${ARGS[@]}"; do
 
     # 2) In-dir file pairs: look for *user-data* and *meta-data* pairs by prefix
     # Build arrays of files
-    mapfile -t ud_files < <(find "$dir" -maxdepth 1 -type f -iname '*user-data*' -print)
-    mapfile -t md_files < <(find "$dir" -maxdepth 1 -type f -iname '*meta-data*' -print)
+    declare -a ud_files=()
+    declare -a md_files=()
+    read_into_array ud_files find "$dir" -maxdepth 1 -type f -iname '*user-data*' -print
+    read_into_array md_files find "$dir" -maxdepth 1 -type f -iname '*meta-data*' -print
 
     # Pair by common prefix before the first '-user-data' or '_user-data' or '.user-data'
     for udfile in "${ud_files[@]}"; do
