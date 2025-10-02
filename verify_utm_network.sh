@@ -14,12 +14,34 @@ if [[ -z "$NET_NAME" ]]; then
   exit 1
 fi
 
-UTM_PREF_DIR="$HOME/Library/Containers/com.utmapp.UTM/Data/Library/Preferences/UTM"
+find_pref_dir() {
+  local candidates=(
+    "$HOME/Library/Group Containers/group.com.utmapp.UTM/Library/Preferences/UTM"
+    "$HOME/Library/Containers/com.utmapp.UTM/Data/Library/Preferences/UTM"
+  )
+
+  for dir in "${candidates[@]}"; do
+    if [[ -d "$dir" ]]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+UTM_PREF_DIR="$(find_pref_dir || true)"
+
+if [[ -z "$UTM_PREF_DIR" ]]; then
+  echo "UTM preferences dir not found in either '~/Library/Group Containers/group.com.utmapp.UTM/Library/Preferences/UTM' or '~/Library/Containers/com.utmapp.UTM/Data/Library/Preferences/UTM'. Open UTM once to initialize preferences." >&2
+  exit 1
+fi
+
 UTM_NETS_PLIST="${UTM_PREF_DIR}/networks.plist"
 VMNET_SYS_PLIST="/Library/Preferences/SystemConfiguration/com.apple.vmnet.plist"
 
 if [[ ! -f "$UTM_NETS_PLIST" ]]; then
-  echo "UTM networks.plist not found. Open UTM once and create a network (or use your create script)." >&2
+  echo "UTM networks.plist not found under ${UTM_PREF_DIR}. Open UTM once and create a network (or use your create script)." >&2
   exit 1
 fi
 
