@@ -41,13 +41,24 @@ NOUNS = [
 def rand_name():
     return f"{random.choice(ADJECTIVES)}-{random.choice(NOUNS)}"
 
+def default_utm_docs():
+    candidates = [
+        os.path.expanduser("~/Library/Group Containers/group.com.utmapp.UTM/Documents"),
+        os.path.expanduser("~/Library/Containers/com.utmapp.UTM/Data/Documents"),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return candidates[-1]
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description="UTM Gallery downloader & installer")
     ap.add_argument("--name", help="Base VM name to set in UTM and folder")
     ap.add_argument("--copies", type=int, default=1, help="Number of installs to create (default 1)")
     ap.add_argument("--downloads", default=os.path.expanduser("~/Downloads"), help="Download dir")
-    ap.add_argument("--utm-docs", default=os.path.expanduser("~/Library/Containers/com.utmapp.UTM/Data/Documents"),
-                    help="UTM Documents dir")
+    ap.add_argument("--utm-docs", default=default_utm_docs(),
+                    help="UTM Documents dir (App Store or direct-download)")
     return ap.parse_args()
 
 def fetch(url):

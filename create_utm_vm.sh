@@ -13,7 +13,29 @@ DISK_GB="${2:-4}"
 SSH_KEY_FILE="${3:-}"
 CLOUD_PKGS="${4:-}"   # comma separated packages for cloud-init install
 
-UTM_DOCS="$HOME/Library/Containers/com.utmapp.UTM/Data/Documents"
+find_docs_dir() {
+  local candidates=(
+    "$HOME/Library/Group Containers/group.com.utmapp.UTM/Documents"
+    "$HOME/Library/Containers/com.utmapp.UTM/Data/Documents"
+  )
+
+  for dir in "${candidates[@]}"; do
+    if [[ -d "$dir" ]]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+UTM_DOCS="$(find_docs_dir || true)"
+
+if [[ -z "$UTM_DOCS" ]]; then
+  echo "UTM documents directory not found in either '~/Library/Group Containers/group.com.utmapp.UTM/Documents' or '~/Library/Containers/com.utmapp.UTM/Data/Documents'. Launch UTM once to initialize it." >&2
+  exit 1
+fi
+
 VM_DIR="${UTM_DOCS}/${VM_NAME}.utm"
 DATA_DIR="${VM_DIR}/Data"
 DISK_FILE="${DATA_DIR}/${VM_NAME}.qcow2"
