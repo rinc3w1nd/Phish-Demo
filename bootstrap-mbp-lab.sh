@@ -112,12 +112,12 @@ detect_and_persist_brew_shellenv() {
   esac
 
   # Line to persist
-  local persist_line='eval "$('"'"'$(brew --prefix)'"'"'/bin/brew'") shellenv"'
+  local persist_line='eval "$($(brew --prefix)/bin/brew shellenv)"'
   # Simpler canonical form that works across prefixes:
-  local brew_eval='eval "$('"'"'brew'""' --prefix 2>/dev/null || true)"/bin/brew shellenv"'
+  local brew_eval='eval "$($(brew --prefix 2>/dev/null || true)/bin/brew shellenv)"'
 
   # Use brew's recommended one
-  local brew_line='eval "$('"'"'$(brew --prefix)'"'"'/bin/brew'") shellenv"'
+  local brew_line='eval "$($(brew --prefix)/bin/brew shellenv)"'
   # Simpler: use `eval "$(/opt/homebrew/bin/brew shellenv)"` if that exists.
   local simpler_line='eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null || true)"'
 
@@ -249,5 +249,4 @@ main() {
 
   echo_header "Bootstrap complete"
 }
-
 main "$@"

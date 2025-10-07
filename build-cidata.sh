@@ -64,25 +64,94 @@ create_iso() {
     return
   fi
 
+  # Ensure the output directory exists and capture an absolute output path. This
+  # avoids issues with tools like hdiutil that may emit artifacts next to the
+  # current working directory rather than respecting relative paths.
+  local outdir
+  outdir=$(dirname "$out")
+  mkdir -p "$outdir"
+  local outfile
+  outfile="$(cd "$outdir" && pwd)/$(basename "$out")"
+
   if [[ "$ISO_TOOL" == "genisoimage" || "$ISO_TOOL" == "mkisofs" ]]; then
     # use -volid cidata and rock/joliet options
-    genisoimage -output "$out" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1
+    if ! "$ISO_TOOL" -output "$outfile" -volid cidata -joliet -rock "$ud" "$md" >/dev/null 2>&1; then
+      echo "    Failed to run $ISO_TOOL" >&2
+      return 1
+    fi
   else
     # macOS: use hdiutil makehybrid
     # put both files into a temp dir and use hdiutil
     tmpd=$(mktemp -d)
     cp "$ud" "$tmpd/user-data"
     cp "$md" "$tmpd/meta-data"
-    hdiutil makehybrid -o "$out" -hfs -joliet -iso -default-volume-name cidata -joliet "$tmpd" >/dev/null 2>&1
+    if ! hdiutil makehybrid -o "$outfile" -hfs -joliet -iso -default-volume-name cidata -joliet "$tmpd" >/dev/null 2>&1; then
+      echo "    Failed to run hdiutil" >&2
+      rm -rf "$tmpd"
+      return 1
+    fi
     rm -rf "$tmpd"
+    # Some hdiutil versions append .cdr; rename to requested path for consistency
+    if [[ ! -f "$outfile" && -f "${outfile}.cdr" ]]; then
+      mv "${outfile}.cdr" "$outfile"
+    fi
   fi
 
-  if [[ -f "$out" ]]; then
+  if [[ -f "$outfile" ]]; then
+    # When the caller used a relative path, the tool wrote to an absolute path
+    # above. Report using the caller's requested location for clarity.
+    if [[ "$outfile" != "$out" ]]; then
+      # Move into place if the caller asked for a relative location.
+      mv "$outfile" "$out"
+    fi
     echo "    Created: $out"
   else
     echo "    Failed to create $out" >&2
     return 1
   fi
+}
+
+# Collect files in a directory matching any of the provided glob patterns.
+# Matches are case-insensitive and limited to the top-level of the directory.
+collect_matching_files() {
+  local __array_name="$1"
+  local __dir="$2"
+  shift 2
+  local __patterns=("$@")
+
+  local -a __matches=()
+  local __pattern
+  local __path
+
+  local __nullglob_state
+  __nullglob_state=$(shopt -p nullglob 2>/dev/null || true)
+  local __nocaseglob_state
+  __nocaseglob_state=$(shopt -p nocaseglob 2>/dev/null || true)
+
+  shopt -s nullglob
+  shopt -s nocaseglob
+
+  for __pattern in "${__patterns[@]}"; do
+    for __path in "$__dir"/${__pattern}; do
+      [[ -f "$__path" ]] || continue
+      __matches+=("$__path")
+    done
+  done
+
+  # Restore previous globbing settings
+  if [[ -n "$__nullglob_state" ]]; then
+    eval "$__nullglob_state"
+  else
+    shopt -u nullglob
+  fi
+  if [[ -n "$__nocaseglob_state" ]]; then
+    eval "$__nocaseglob_state"
+  else
+    shopt -u nocaseglob
+  fi
+
+  # shellcheck disable=SC2034
+  eval "$__array_name=(\"\${__matches[@]}\")"
 }
 
 # If caller passed exactly two file args, treat as single pair
@@ -120,30 +189,34 @@ for p in "${ARGS[@]}"; do
 
     # 2) In-dir file pairs: look for *user-data* and *meta-data* pairs by prefix
     # Build arrays of files
-    mapfile -t ud_files < <(find "$dir" -maxdepth 1 -type f -iname '*user-data*' -print)
-    mapfile -t md_files < <(find "$dir" -maxdepth 1 -type f -iname '*meta-data*' -print)
+    declare -a ud_files=()
+    declare -a md_files=()
+    collect_matching_files ud_files "$dir" '*user-data*'
+    collect_matching_files md_files "$dir" '*meta-data*'
 
     # Pair by common prefix before the first '-user-data' or '_user-data' or '.user-data'
-    for udfile in "${ud_files[@]}"; do
-      udbase=$(basename "$udfile")
-      # strip the user-data portion
-      prefix=$(echo "$udbase" | sed -E 's/([-_.]?user-data.*)$//I')
-      # find matching meta file
-      match=""
-      for mf in "${md_files[@]}"; do
-        mbase=$(basename "$mf")
-        if [[ "$mbase" == "${prefix}"* ]]; then
-          match="$mf"
-          break
+    if [[ ${#ud_files[@]} -gt 0 && ${#md_files[@]} -gt 0 ]]; then
+      for udfile in "${ud_files[@]}"; do
+        udbase=$(basename "$udfile")
+        # strip the user-data portion
+        prefix=$(echo "$udbase" | sed -E 's/([-_.]?user-data.*)$//I')
+        # find matching meta file
+        match=""
+        for mf in "${md_files[@]}"; do
+          mbase=$(basename "$mf")
+          if [[ "$mbase" == "${prefix}"* ]]; then
+            match="$mf"
+            break
+          fi
+        done
+        if [[ -n "$match" ]]; then
+          # choose basename for output
+          outbase="${prefix:-cidata}"
+          out="${OUTDIR}/${outbase}-cidata.iso"
+          create_iso "$udfile" "$match" "$out"
         fi
       done
-      if [[ -n "$match" ]]; then
-        # choose basename for output
-        outbase="${prefix:-cidata}"
-        out="${OUTDIR}/${outbase}-cidata.iso"
-        create_iso "$udfile" "$match" "$out"
-      fi
-    done
+    fi
 
     # 3) fallback: if there is exactly one user-data and one meta-data in dir, use them
     if [[ ${#ud_files[@]} -eq 1 && ${#md_files[@]} -eq 1 ]]; then

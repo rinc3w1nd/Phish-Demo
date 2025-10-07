@@ -8,13 +8,30 @@ set -euo pipefail
 NET_NAME="${1:-lab-net}"
 NET_TYPE="${2:-host}"   # default to host-only
 
-PREF_DIR="$HOME/Library/Containers/com.utmapp.UTM/Data/Library/Preferences/UTM"
-PREF_FILE="${PREF_DIR}/networks.plist"
+find_pref_dir() {
+  local candidates=(
+    "$HOME/Library/Group Containers/group.com.utmapp.UTM/Library/Preferences/UTM"
+    "$HOME/Library/Containers/com.utmapp.UTM/Data/Library/Preferences/UTM"
+  )
 
-if [[ ! -d "$PREF_DIR" ]]; then
-  echo "UTM preferences dir not found. Did you run UTM once?"
+  for dir in "${candidates[@]}"; do
+    if [[ -d "$dir" ]]; then
+      printf '%s' "$dir"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+PREF_DIR="$(find_pref_dir || true)"
+
+if [[ -z "$PREF_DIR" ]]; then
+  echo "UTM preferences dir not found in either '~/Library/Group Containers/group.com.utmapp.UTM/Library/Preferences/UTM' or '~/Library/Containers/com.utmapp.UTM/Data/Library/Preferences/UTM'. Did you run UTM once?"
   exit 1
 fi
+
+PREF_FILE="${PREF_DIR}/networks.plist"
 
 case "$NET_TYPE" in
   host|shared|bridged) ;;
