@@ -1,254 +1,244 @@
 #!/usr/bin/env bash
-# lab-ca.sh — minimal offline lab CA helper
-# Usage:
-#   ./lab-ca.sh init
-#   ./lab-ca.sh issue --name demo-login.lab --dns demo-login.lab,assets.demo-login.lab --ip 10.0.100.20
-#   ./lab-ca.sh revoke --cert-file issued/demo-login.lab.crt.pem
-#   ./lab-ca.sh crl
-#
-# NOTES:
-# - Default workspace: ~/lab-ca (change WORKDIR below)
-# - Root key is 4096-bit RSA. Server keys are 2048-bit RSA.
-# - Cert validity: root 10y, server 825 days (browser-friendly).
-# - Keep lab CA private key inside isolated LAB-DC; do not reuse elsewhere.
+# lab-ca.sh -- Minimal lab CA with DB: init | issue | revoke | crl
+# - Uses OpenSSL CA database (index.txt) so revoke/CRL work.
+# - Avoids fragile -extfile by embedding v3_server/alt_names into a per-issue temp config.
+# - POSIX-friendly; no Bash 4 features needed.
+
 set -euo pipefail
 
-WORKDIR="${LAB_CA_DIR:-$HOME/lab-ca}"
-OPENSSL_CONF="$WORKDIR/openssl.cnf"
-DAYS_SERVER=825
-DAYS_ROOT=3650
-ROOT_KEY_BITS=4096
-SERVER_KEY_BITS=2048
-CRL_DAYS=30
+# ---- Config (override via env if you like) ----
+WORKDIR="${WORKDIR:-$(pwd)/lab-ca}"
+CA_KEY_BITS="${CA_KEY_BITS:-4096}"
+SRV_KEY_BITS="${SRV_KEY_BITS:-2048}"
+DAYS="${DAYS:-825}"        # leaf cert validity
+CA_DAYS="${CA_DAYS:-3650}" # root CA validity
+OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
+SUBJECT_CA="${SUBJECT_CA:-/CN=PhishDemo Lab Root CA}"
+SUBJECT_SRV_CN_FALLBACK="localhost"   # used if --name empty (shouldn’t happen)
 
-# Helper: print usage
-usage() {
-  cat <<EOF
-lab-ca.sh — simple lab CA helper
+# ---- Helpers ----
+log(){ printf '%s\n' "$*" >&2; }
+fail(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || fail "Missing dependency: $1"; }
+mkp(){ mkdir -p "$1" || fail "mkdir -p $1"; }
+sanitize_csv(){ printf '%s' "$1" | tr -d '[:space:]' | sed -e 's/,,*/,/g' -e 's/^,//' -e 's/,$//'; }
 
-Commands:
-  init                                 Initialize CA directory structure and create root key+cert
-  issue --name NAME [--dns DNSLIST] [--ip IPLIST]
-                                       Issue server cert for NAME. DNSLIST comma-separated.
-  revoke --cert-file PATH              Revoke a cert and add to CRL (optional)
-  crl                                  Regenerate current CRL
-  help
-
-Examples:
-  ./lab-ca.sh init
-  ./lab-ca.sh issue --name demo-login.lab --dns demo-login.lab,assets.demo-login.lab --ip 10.0.100.20
-  ./lab-ca.sh revoke --cert-file issued/demo-login.lab.crt.pem
-EOF
+base_paths() {
+  CA_KEY="$WORKDIR/private/ca.key.pem"
+  CA_CERT="$WORKDIR/issued/ca.crt.pem"
+  CNF_BASE="$WORKDIR/openssl.cnf"
+  DB_DIR="$WORKDIR"
+  DB_INDEX="$WORKDIR/index.txt"
+  DB_SERIAL="$WORKDIR/serial"
+  DB_CRLNUM="$WORKDIR/crlnumber"
+  CRL_PEM="$WORKDIR/issued/ca.crl.pem"
 }
 
-# Ensure directories & baseline openssl.cnf template
-init_ca() {
-  if [[ -d "$WORKDIR" ]]; then
-    echo "Workspace $WORKDIR already exists. Continuing (no overwrite)."
-  else
-    mkdir -p "$WORKDIR"
-  fi
-
-  pushd "$WORKDIR" >/dev/null
-  mkdir -p certs crl newcerts private requests issued
-  chmod 700 private
-  touch index.txt
-  echo 1000 > serial
-  echo 1000 > crlnumber
-
-  cat > "$OPENSSL_CONF" <<'CONF'
-# Minimal openssl.cnf for a tiny lab CA
+write_base_cnf() {
+  # Minimal CA config with sane defaults; paths point into WORKDIR.
+  cat >"$CNF_BASE" <<EOF
 [ ca ]
 default_ca = CA_default
 
 [ CA_default ]
-dir               = __WORKDIR__
-certs             = $dir/certs
-crl_dir           = $dir/crl
-database          = $dir/index.txt
-new_certs_dir     = $dir/newcerts
-certificate       = $dir/issued/ca.crt.pem
-serial            = $dir/serial
-crlnumber         = $dir/crlnumber
-private_key       = $dir/private/ca.key.pem
-RANDFILE          = $dir/private/.rand
-default_days      = 825
-default_md        = sha256
-preserve          = no
-policy            = policy_any
+dir               = $WORKDIR
+certs             = \$dir/issued
+crl_dir           = \$dir/issued
+database          = \$dir/index.txt
+new_certs_dir     = \$dir/issued
+certificate       = \$dir/issued/ca.crt.pem
+serial            = \$dir/serial
+crlnumber         = \$dir/crlnumber
+crl               = \$dir/issued/ca.crl.pem
+private_key       = \$dir/private/ca.key.pem
+RANDFILE          = \$dir/.rand
 
-[ policy_any ]
+default_md        = sha256
+name_opt          = ca_default
+cert_opt          = ca_default
+default_days      = $DAYS
+preserve          = no
+policy            = policy_loose
+copy_extensions   = copy
+
+[ policy_loose ]
 countryName             = optional
 stateOrProvinceName     = optional
-localityName            = optional
 organizationName        = optional
 organizationalUnitName  = optional
 commonName              = supplied
 emailAddress            = optional
+EOF
+}
 
-[ req ]
-default_bits        = 2048
-distinguished_name  = req_distinguished_name
-string_mask         = utf8only
-default_md          = sha256
-prompt              = no
+cmd_init() {
+  need "$OPENSSL_BIN"
+  base_paths
+  log "Initializing CA at: $WORKDIR"
+  mkp "$WORKDIR" "$WORKDIR/private" "$WORKDIR/issued" "$WORKDIR/requests" "$WORKDIR/tmp"
 
-[ req_distinguished_name ]
-C  = US
-ST = Lab
-L  = Lab
-O  = ExampleLab
-OU = Demo
-
-[ v3_ca ]
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid:always,issuer
-basicConstraints = critical, CA:true
-keyUsage = critical, digitalSignature, cRLSign, keyCertSign
-
-[ v3_server ]
-basicConstraints = CA:FALSE
-nsCertType = server
-nsComment = "Demo server certificate"
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer
-keyUsage = digitalSignature, keyEncipherment
-extendedKeyUsage = serverAuth
-subjectAltName = @alt_names
-
-[ alt_names ]
-# filled dynamically when issuing
-CONF
-
-  # replace placeholder with actual WORKDIR in config file
-  sed -i.bak "s|__WORKDIR__|$WORKDIR|g" "$OPENSSL_CONF"
-
-  # Generate root key and cert
-  if [[ -f "$WORKDIR/private/ca.key.pem" ]]; then
-    echo "Root key already exists at $WORKDIR/private/ca.key.pem — skipping generation."
+  if [ -f "$CA_KEY" ] || [ -f "$CA_CERT" ]; then
+    log "CA material already exists:"
+    [ -f "$CA_KEY" ]  && log "  Key : $CA_KEY"
+    [ -f "$CA_CERT" ] && log "  Cert: $CA_CERT"
   else
-    echo "Generating root key ($ROOT_KEY_BITS bits) and self-signed certificate..."
-    openssl genpkey -algorithm RSA -out private/ca.key.pem -pkeyopt rsa_keygen_bits:$ROOT_KEY_BITS
-    chmod 400 private/ca.key.pem
-    openssl req -config "$OPENSSL_CONF" -key private/ca.key.pem -new -x509 -days $DAYS_ROOT -sha256 -extensions v3_ca -out issued/ca.crt.pem -subj "/C=US/ST=Lab/L=Lab/O=ExampleLab/OU=Demo CA/CN=ExampleLab Root CA"
-    chmod 444 issued/ca.crt.pem
-    echo "Root CA created: $WORKDIR/issued/ca.crt.pem"
+    log "Generating CA key ($CA_KEY_BITS bits)…"
+    "$OPENSSL_BIN" genrsa -out "$CA_KEY" "$CA_KEY_BITS" >/dev/null 2>&1 || fail "CA keygen failed"
+    chmod 600 "$CA_KEY"
+    log "Generating self-signed CA cert ($CA_DAYS days)…"
+    "$OPENSSL_BIN" req -x509 -new -nodes -key "$CA_KEY" -sha256 -days "$CA_DAYS" \
+      -subj "$SUBJECT_CA" -out "$CA_CERT"
+    log "Created:"
+    log "  $CA_KEY"
+    log "  $CA_CERT"
   fi
 
-  # Create initial CRL
-  openssl ca -config "$OPENSSL_CONF" -gencrl -out crl/ca.crl.pem 2>/dev/null || true
+  # DB files
+  [ -f "$DB_INDEX" ] || : >"$DB_INDEX"
+  [ -f "$DB_SERIAL" ] || echo "1000" >"$DB_SERIAL"
+  [ -f "$DB_CRLNUM" ] || echo "1000" >"$DB_CRLNUM"
 
-  popd >/dev/null
-  echo "CA initialization complete in $WORKDIR"
+  # Base config
+  write_base_cnf
+  log "Wrote base OpenSSL config: $CNF_BASE"
+  log "Done."
 }
 
-# Helper to create a temporary openssl extfile with SANs
-_make_san_extfile() {
-  local name="$1"
-  local dnslist="$2"
-  local iplist="$3"
-  local extfile="$WORKDIR/requests/${name}.ext"
-  mkdir -p "$WORKDIR/requests"
-  {
-    echo "subjectAltName = @alt_names"
-    echo
-    echo "[alt_names]"
-    local idx=1
-    if [[ -n "$dnslist" ]]; then
-      IFS=',' read -ra DNSARR <<< "$dnslist"
-      for d in "${DNSARR[@]}"; do
-        echo "DNS.$idx = $d"
-        idx=$((idx+1))
-      done
-    fi
-    if [[ -n "$iplist" ]]; then
-      IFS=',' read -ra IPARR <<< "$iplist"
-      for ip in "${IPARR[@]}"; do
-        echo "IP.$idx = $ip"
-        idx=$((idx+1))
-      done
-    fi
-  } > "$extfile"
-  echo "$extfile"
-}
+cmd_issue() {
+  need "$OPENSSL_BIN"
+  base_paths
 
-# Issue server cert
-issue_cert() {
-  local name="" dnslist="" iplist=""
-  while [[ $# -gt 0 ]]; do
+  NAME=""
+  DNS_CSV=""
+  IP_CSV=""
+  while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="$2"; shift 2 ;;
-      --dns) dnslist="$2"; shift 2 ;;
-      --ip) iplist="$2"; shift 2 ;;
-      *) echo "Unknown arg $1"; usage; exit 1 ;;
+      --name) NAME="${2:-}"; shift 2 ;;
+      --dns)  DNS_CSV="${2:-}"; shift 2 ;;
+      --ip)   IP_CSV="${2:-}";  shift 2 ;;
+      -h|--help) printf 'Usage: %s issue --name NAME [--dns a,b] [--ip x,y]\n' "$0"; exit 0 ;;
+      *) fail "Unknown arg: $1" ;;
     esac
   done
-  if [[ -z "$name" ]]; then echo "Missing --name"; usage; exit 1; fi
+  [ -n "$NAME" ] || NAME="$SUBJECT_SRV_CN_FALLBACK"
 
-  pushd "$WORKDIR" >/dev/null
+  [ -f "$CA_KEY" ] && [ -f "$CA_CERT" ] && [ -f "$CNF_BASE" ] || fail "CA not initialized. Run: $0 init"
 
-  # create private key and CSR
-  mkdir -p requests issued private
-  keyfile="private/${name}.key.pem"
-  csr="requests/${name}.csr.pem"
-  cert="issued/${name}.crt.pem"
+  DNS_CSV="$(sanitize_csv "${DNS_CSV:-}")"
+  IP_CSV="$(sanitize_csv "${IP_CSV:-}")"
 
-  if [[ -f "$cert" ]]; then
-    echo "Cert already exists at $cert — refusing to overwrite."
-    popd >/dev/null; return 1
+  SRV_KEY="$WORKDIR/requests/$NAME.key.pem"
+  SRV_CSR="$WORKDIR/requests/$NAME.csr.pem"
+  SRV_CRT="$WORKDIR/issued/$NAME.crt.pem"
+
+  if [ ! -f "$SRV_KEY" ]; then
+    log "Generating server key ($SRV_KEY_BITS bits)…"
+    "$OPENSSL_BIN" genrsa -out "$SRV_KEY" "$SRV_KEY_BITS" >/dev/null 2>&1 || fail "server keygen failed"
+    chmod 600 "$SRV_KEY"
+  else
+    log "Reusing existing server key: $SRV_KEY"
   fi
 
-  echo "Generating server key..."
-  openssl genpkey -algorithm RSA -out "$keyfile" -pkeyopt rsa_keygen_bits:$SERVER_KEY_BITS
-  chmod 400 "$keyfile"
+  log "Generating CSR for CN=$NAME…"
+  "$OPENSSL_BIN" req -new -key "$SRV_KEY" -sha256 -subj "/CN=$NAME" -out "$SRV_CSR"
 
-  echo "Generating CSR (CN=$name)..."
-  openssl req -new -key "$keyfile" -out "$csr" -subj "/C=US/ST=Lab/L=Lab/O=ExampleLab/OU=Demo/CN=$name"
+  # Build a per-issue temp config that includes v3_server + alt_names
+  CNF_ISSUE="$WORKDIR/tmp/$NAME.cnf"
+  cp "$CNF_BASE" "$CNF_ISSUE"
 
-  # create extfile with SANs
-  extfile=$(_make_san_extfile "$name" "$dnslist" "$iplist")
+  {
+    echo
+    echo "[ v3_server ]"
+    echo "basicConstraints = CA:FALSE"
+    echo "keyUsage = critical, digitalSignature, keyEncipherment"
+    echo "extendedKeyUsage = serverAuth"
+    echo "subjectAltName = @alt_names"
+    echo
+    echo "[ alt_names ]"
+    i=1
+    if [ -n "$DNS_CSV" ]; then
+      IFS=','; set -f
+      for d in $DNS_CSV; do
+        [ -n "$d" ] && printf 'DNS.%d = %s\n' "$i" "$d" && i=$((i+1))
+      done
+      set +f
+    fi
+    j=1
+    if [ -n "$IP_CSV" ]; then
+      IFS=','; set -f
+      for ip in $IP_CSV; do
+        [ -n "$ip" ] && printf 'IP.%d = %s\n' "$j" "$ip" && j=$((j+1))
+      done
+      set +f
+    fi
+  } >>"$CNF_ISSUE"
 
-  echo "Signing certificate for $name (SANs: DNS=$dnslist IP=$iplist) ..."
-  openssl ca -config "$OPENSSL_CONF" -extensions v3_server -days $DAYS_SERVER -notext -md sha256 -in "$csr" -out "$cert" -extfile "$extfile" -batch
-  chmod 444 "$cert"
+  log "Signing certificate (DB-backed) with embedded v3_server…"
+  "$OPENSSL_BIN" ca -batch -notext -config "$CNF_ISSUE" \
+    -extensions v3_server \
+    -in "$SRV_CSR" -out "$SRV_CRT" -days "$DAYS" -md sha256
 
-  echo "Issued certificate: $cert"
-  echo "Server key: $keyfile"
-  echo "CA cert: $WORKDIR/issued/ca.crt.pem"
-
-  popd >/dev/null
+  log "Issued:"
+  log "  Cert: $SRV_CRT"
+  log "  CSR : $SRV_CSR"
+  log "  Key : $SRV_KEY"
 }
 
-# Revoke cert
-revoke_cert() {
-  local certfile="$1"
-  if [[ -z "$certfile" || ! -f "$certfile" ]]; then
-    echo "Please pass a valid issued cert path to revoke."
-    exit 1
-  fi
-  pushd "$WORKDIR" >/dev/null
-  echo "Revoking $certfile ..."
-  openssl ca -config "$OPENSSL_CONF" -revoke "$certfile"
-  openssl ca -config "$OPENSSL_CONF" -gencrl -out crl/ca.crl.pem
-  popd >/dev/null
-  echo "Revoked and CRL regenerated at $WORKDIR/crl/ca.crl.pem"
+cmd_revoke() {
+  need "$OPENSSL_BIN"
+  base_paths
+  CERT_FILE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cert-file) CERT_FILE="${2:-}"; shift 2 ;;
+      -h|--help) printf 'Usage: %s revoke --cert-file issued/NAME.crt.pem\n' "$0"; exit 0 ;;
+      *) fail "Unknown arg: $1" ;;
+    esac
+  done
+  [ -n "$CERT_FILE" ] || fail "--cert-file is required"
+  [ -f "$CNF_BASE" ] || fail "Missing $CNF_BASE (run init)"
+  [ -f "$CERT_FILE" ] || fail "Cert not found: $CERT_FILE"
+
+  log "Revoking certificate: $CERT_FILE"
+  "$OPENSSL_BIN" ca -config "$CNF_BASE" -revoke "$CERT_FILE" -crl_reason keyCompromise
+  log "Revoked. Now generate CRL with: $0 crl"
 }
 
-# Regenerate CRL
-regen_crl() {
-  pushd "$WORKDIR" >/dev/null
-  openssl ca -config "$OPENSSL_CONF" -gencrl -out crl/ca.crl.pem
-  popd >/dev/null
-  echo "CRL regenerated: $WORKDIR/crl/ca.crl.pem"
+cmd_crl() {
+  need "$OPENSSL_BIN"
+  base_paths
+  [ -f "$CNF_BASE" ] || fail "Missing $CNF_BASE (run init)"
+  log "Generating CRL: $CRL_PEM"
+  "$OPENSSL_BIN" ca -config "$CNF_BASE" -gencrl -out "$CRL_PEM"
+  log "CRL written to $CRL_PEM"
 }
 
-# CLI dispatch
-cmd="${1:-help}"
-case "$cmd" in
-  init) init_ca ;;
-  issue) shift; issue_cert "$@" ;;
-  revoke) shift; revoke_cert "$@" ;;
-  crl) regen_crl ;;
-  help|--help|-h) usage ;;
-  *) echo "Unknown command: $cmd"; usage; exit 2 ;;
-esac
+usage() {
+  cat <<EOF
+Usage:
+  $0 init
+  $0 issue --name NAME [--dns a.example,b.example] [--ip 10.0.100.20,203.0.113.45]
+  $0 revoke --cert-file issued/NAME.crt.pem
+  $0 crl
+
+Notes:
+  - CA files live in: $WORKDIR
+  - Issued certs:     $WORKDIR/issued
+  - Requests/keys:    $WORKDIR/requests
+  - Base config:      $WORKDIR/openssl.cnf
+EOF
+}
+
+main() {
+  [ $# -gt 0 ] || { usage; exit 1; }
+  cmd="$1"; shift || true
+  case "$cmd" in
+    init)   cmd_init "$@";;
+    issue)  cmd_issue "$@";;
+    revoke) cmd_revoke "$@";;
+    crl)    cmd_crl "$@";;
+    -h|--help) usage;;
+    *) usage; exit 1;;
+  esac
+}
+main "$@"
