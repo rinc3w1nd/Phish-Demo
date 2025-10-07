@@ -1,20 +1,39 @@
 #!/usr/bin/env bash
 # lab-ca.sh -- Minimal lab CA with DB: init | issue | revoke | crl
-# - Uses OpenSSL CA database (index.txt) so revoke/CRL work.
-# - Avoids fragile -extfile by embedding v3_server/alt_names into a per-issue temp config.
-# - POSIX-friendly; no Bash 4 features needed.
-
+# - Initializes a real OpenSSL CA database (index.txt, serial, crlnumber).
+# - Issues server certs with SANs using `openssl ca` and a per-issue config
+#   that embeds [ v3_server ] and [ alt_names ] (no fragile external extfile).
+# - Revokes certs and produces a CRL.
+# - POSIX-friendly; works on macOS (LibreSSL) and Linux (OpenSSL).
+#
+# Usage:
+#   ./lab-ca.sh init
+#   ./lab-ca.sh issue --name demo-login.lab --dns demo-login.lab,assets.demo-login.lab --ip 10.0.100.20
+#   ./lab-ca.sh revoke --cert-file lab-ca/issued/demo-login.lab.crt.pem
+#   ./lab-ca.sh crl
+#
+# Environment overrides (optional):
+#   WORKDIR       default: ./lab-ca
+#   CA_KEY_BITS   default: 4096
+#   SRV_KEY_BITS  default: 2048
+#   DAYS          default: 825   (leaf validity)
+#   CA_DAYS       default: 3650  (root validity)
+#   OPENSSL_BIN   default: openssl
+#   SUBJECT_CA    default: /CN=PhishDemo Lab Root CA
+#
 set -euo pipefail
 
-# ---- Config (override via env if you like) ----
+# Ensure no global OpenSSL config is implicitly loaded (prevents extfile confusion)
+export OPENSSL_CONF=/dev/null
+
+# ---- Config ----
 WORKDIR="${WORKDIR:-$(pwd)/lab-ca}"
 CA_KEY_BITS="${CA_KEY_BITS:-4096}"
 SRV_KEY_BITS="${SRV_KEY_BITS:-2048}"
-DAYS="${DAYS:-825}"        # leaf cert validity
-CA_DAYS="${CA_DAYS:-3650}" # root CA validity
+DAYS="${DAYS:-825}"        # ~27 months (lab leaf)
+CA_DAYS="${CA_DAYS:-3650}" # 10 years (lab root)
 OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
 SUBJECT_CA="${SUBJECT_CA:-/CN=PhishDemo Lab Root CA}"
-SUBJECT_SRV_CN_FALLBACK="localhost"   # used if --name empty (shouldn’t happen)
 
 # ---- Helpers ----
 log(){ printf '%s\n' "$*" >&2; }
@@ -35,7 +54,7 @@ base_paths() {
 }
 
 write_base_cnf() {
-  # Minimal CA config with sane defaults; paths point into WORKDIR.
+  # Minimal CA config; paths point into WORKDIR.
   cat >"$CNF_BASE" <<EOF
 [ ca ]
 default_ca = CA_default
@@ -59,7 +78,7 @@ cert_opt          = ca_default
 default_days      = $DAYS
 preserve          = no
 policy            = policy_loose
-copy_extensions   = copy
+copy_extensions   = none
 
 [ policy_loose ]
 countryName             = optional
@@ -68,6 +87,22 @@ organizationName        = optional
 organizationalUnitName  = optional
 commonName              = supplied
 emailAddress            = optional
+EOF
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 init
+  $0 issue  --name NAME [--dns a.example,b.example] [--ip 10.0.100.20,203.0.113.45]
+  $0 revoke --cert-file lab-ca/issued/NAME.crt.pem
+  $0 crl
+
+Notes:
+  - CA files live in: $WORKDIR
+  - Issued certs:     $WORKDIR/issued
+  - Requests/keys:    $WORKDIR/requests
+  - Base config:      $WORKDIR/openssl.cnf
 EOF
 }
 
@@ -93,12 +128,10 @@ cmd_init() {
     log "  $CA_CERT"
   fi
 
-  # DB files
   [ -f "$DB_INDEX" ] || : >"$DB_INDEX"
   [ -f "$DB_SERIAL" ] || echo "1000" >"$DB_SERIAL"
   [ -f "$DB_CRLNUM" ] || echo "1000" >"$DB_CRLNUM"
 
-  # Base config
   write_base_cnf
   log "Wrote base OpenSSL config: $CNF_BASE"
   log "Done."
@@ -115,17 +148,17 @@ cmd_issue() {
     case "$1" in
       --name) NAME="${2:-}"; shift 2 ;;
       --dns)  DNS_CSV="${2:-}"; shift 2 ;;
-      --ip)   IP_CSV="${2:-}";  shift 2 ;;
+      --ip)   IP_CSV="${2:-}"; shift 2 ;;
       -h|--help) printf 'Usage: %s issue --name NAME [--dns a,b] [--ip x,y]\n' "$0"; exit 0 ;;
       *) fail "Unknown arg: $1" ;;
     esac
   done
-  [ -n "$NAME" ] || NAME="$SUBJECT_SRV_CN_FALLBACK"
+  [ -n "$NAME" ] || fail "--name is required"
 
   [ -f "$CA_KEY" ] && [ -f "$CA_CERT" ] && [ -f "$CNF_BASE" ] || fail "CA not initialized. Run: $0 init"
 
   DNS_CSV="$(sanitize_csv "${DNS_CSV:-}")"
-  IP_CSV="$(sanitize_csv "${IP_CSV:-}")"
+  IP_CSV="$(sanitize_csv  "${IP_CSV:-}")"
 
   SRV_KEY="$WORKDIR/requests/$NAME.key.pem"
   SRV_CSR="$WORKDIR/requests/$NAME.csr.pem"
@@ -142,7 +175,7 @@ cmd_issue() {
   log "Generating CSR for CN=$NAME…"
   "$OPENSSL_BIN" req -new -key "$SRV_KEY" -sha256 -subj "/CN=$NAME" -out "$SRV_CSR"
 
-  # Build a per-issue temp config that includes v3_server + alt_names
+  # Build per-issue config with embedded v3_server/alt_names
   CNF_ISSUE="$WORKDIR/tmp/$NAME.cnf"
   cp "$CNF_BASE" "$CNF_ISSUE"
 
@@ -173,8 +206,15 @@ cmd_issue() {
     fi
   } >>"$CNF_ISSUE"
 
-  log "Signing certificate (DB-backed) with embedded v3_server…"
-  "$OPENSSL_BIN" ca -batch -notext -config "$CNF_ISSUE" \
+  # If no SANs were provided, add a safe fallback SAN = CN
+  if ! grep -qE '^(DNS|IP)\.[0-9]+[[:space:]]*=' "$CNF_ISSUE"; then
+    printf '\n# fallback SAN when none specified\n[ alt_names ]\nDNS.1 = %s\n' "$NAME" >> "$CNF_ISSUE"
+  fi
+
+  log "Signing certificate (DB-backed)…"
+  "$OPENSSL_BIN" ca -batch -notext \
+    -config    "$CNF_ISSUE" \
+    -extfile   "$CNF_ISSUE" \
     -extensions v3_server \
     -in "$SRV_CSR" -out "$SRV_CRT" -days "$DAYS" -md sha256
 
@@ -187,11 +227,12 @@ cmd_issue() {
 cmd_revoke() {
   need "$OPENSSL_BIN"
   base_paths
+
   CERT_FILE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --cert-file) CERT_FILE="${2:-}"; shift 2 ;;
-      -h|--help) printf 'Usage: %s revoke --cert-file issued/NAME.crt.pem\n' "$0"; exit 0 ;;
+      -h|--help) printf 'Usage: %s revoke --cert-file lab-ca/issued/NAME.crt.pem\n' "$0"; exit 0 ;;
       *) fail "Unknown arg: $1" ;;
     esac
   done
@@ -211,22 +252,6 @@ cmd_crl() {
   log "Generating CRL: $CRL_PEM"
   "$OPENSSL_BIN" ca -config "$CNF_BASE" -gencrl -out "$CRL_PEM"
   log "CRL written to $CRL_PEM"
-}
-
-usage() {
-  cat <<EOF
-Usage:
-  $0 init
-  $0 issue --name NAME [--dns a.example,b.example] [--ip 10.0.100.20,203.0.113.45]
-  $0 revoke --cert-file issued/NAME.crt.pem
-  $0 crl
-
-Notes:
-  - CA files live in: $WORKDIR
-  - Issued certs:     $WORKDIR/issued
-  - Requests/keys:    $WORKDIR/requests
-  - Base config:      $WORKDIR/openssl.cnf
-EOF
 }
 
 main() {
